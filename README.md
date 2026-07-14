@@ -123,27 +123,3 @@ tixel wallpaper.png
 | Video | `mp4`, `mov`, `avi`, `webm`, `mkv`, `m4v` |
 | Image | `png`, `jpg`, `jpeg`, `bmp`, `gif`, `webp` |
 
-
-## Project structure
-
-```
-src/
-├── main.rs      # CLI, media loading, rendering, audio, tests
-└── error.rs     # Error enum with user-facing messages in Italian
-```
-
-## License
-
-MIT
-
-## Project structure
-
-```
-src/
-├── main.rs      # CLI, media loading, rendering, audio, tests
-└── error.rs     # Error enum with user-facing messages in Italian
-```
-
-## License
-
-MIT
