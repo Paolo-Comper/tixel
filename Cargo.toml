@@ -1,0 +1,14 @@
+[package]
+name = "tixel"
+version = "0.1.0"
+edition = "2024"
+description = "Display images and videos in your terminal using Unicode half-block characters"
+authors = ["Paolo-Comper"]
+license = "MIT"
+
+[dependencies]
+crossterm = "0.29.0"
+image = "0.25.6"
+video-rs = "0.11.0"
+clap = { version = "4", features = ["derive"] }
+ctrlc = "3.4"

@@ -1,0 +1,11 @@
+/target
+/.ffmpeg-dev
+/.cargo
+*.png
+*.jpeg
+*.jpg
+*.mp4
+*.mov
+*.avi
+*.webm
+*.mkv
