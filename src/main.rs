@@ -1,25 +1,30 @@
 use clap::Parser;
 use crossterm::terminal;
-use image::{
-    imageops::FilterType::Triangle,
-    RgbaImage,
-};
+use image::{RgbaImage, imageops::FilterType::Triangle};
+use std::sync::mpsc;
+use std::thread;
 use std::{
-    fmt::Write,
-    io::{stdout, Write as IoWrite},
+    io::{Write as IoWrite, stdout},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::atomic::{AtomicBool, Ordering},
     sync::Arc,
+    sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
-use video_rs::{decode::Decoder, Location};
+use video_rs::{Location, decode::Decoder};
 
 mod error;
 use error::ImgToTerminalError as Error;
 
+mod lookup_table;
+use lookup_table::LUT;
+
 #[derive(Parser)]
-#[command(name = "tixel", version, about = "Display images and videos in the terminal")]
+#[command(
+    name = "tixel",
+    version,
+    about = "Display images and videos in the terminal"
+)]
 struct Args {
     /// Path to the input file (image or video)
     input: PathBuf,
@@ -43,6 +48,8 @@ fn main() {
 }
 
 fn run(args: &Args) -> Result<(), Error> {
+    let (tx, rx) = mpsc::sync_channel(3);
+
     if !args.input.exists() {
         return Err(Error::FileNotFound(args.input.display().to_string()));
     }
@@ -61,14 +68,14 @@ fn run(args: &Args) -> Result<(), Error> {
     // One text row = 2 pixel rows via half-block ▄
     let max_height = (term_rows.saturating_sub(1) * 2) as u32;
 
-    let (frames, detected_fps) =
-        load_media(&args.input, target_width, max_height)?;
+    let tx1 = tx.clone();
+    let detected_fps = load_media(&args.input, target_width, max_height, tx1)?;
 
-    if frames.is_empty() {
-        return Err(Error::NoFrames(args.input.display().to_string()));
-    }
-
-    let fps = if args.fps > 0.0 { args.fps } else { detected_fps };
+    let fps = if args.fps > 0.0 {
+        args.fps
+    } else {
+        detected_fps
+    };
 
     // Background audio playback (ffplay) for videos only
     let audio = if fps > 0.0 {
@@ -77,7 +84,7 @@ fn run(args: &Args) -> Result<(), Error> {
         AudioPlayer(None)
     };
 
-    render_loop(&frames, fps)?;
+    render_loop(rx, fps)?;
 
     audio.wait();
     Ok(())
@@ -113,13 +120,14 @@ fn load_media(
     path: &Path,
     target_width: u32,
     max_height: u32,
-) -> Result<(Vec<RgbaImage>, f32), Error> {
+    tx: mpsc::SyncSender<RgbaImage>,
+) -> Result<f32, Error> {
     detect_file_type(path)?;
 
     if is_video_file(path) {
-        load_video(path, target_width, max_height)
+        load_video(path, target_width, max_height, tx)
     } else {
-        load_image(path, target_width, max_height)
+        load_image(path, target_width, max_height, tx)
     }
 }
 
@@ -127,19 +135,22 @@ fn load_image(
     path: &Path,
     target_width: u32,
     max_height: u32,
-) -> Result<(Vec<RgbaImage>, f32), Error> {
+    tx: mpsc::SyncSender<RgbaImage>,
+) -> Result<f32, Error> {
     let img = image::open(path)?;
     let (w, h) = (img.width(), img.height());
     let (out_w, out_h) = proportional_size(w, h, target_width, max_height);
     let resized = img.resize_exact(out_w, out_h, Triangle).to_rgba8();
-    Ok((vec![resized], 0.0))
+    tx.send(resized).unwrap();
+    Ok(0.0)
 }
 
 fn load_video(
     path: &Path,
     target_width: u32,
     max_height: u32,
-) -> Result<(Vec<RgbaImage>, f32), Error> {
+    tx: mpsc::SyncSender<RgbaImage>,
+) -> Result<f32, Error> {
     video_rs::init().map_err(|e| Error::VideoInit(e.to_string()))?;
 
     let mut decoder =
@@ -151,49 +162,48 @@ fn load_video(
     let (in_w, in_h) = decoder.size();
     let (out_w, out_h) = proportional_size(in_w, in_h, target_width, max_height);
 
-    let mut frames = Vec::new();
+    thread::spawn(move || {
+        for result in decoder.decode_raw_iter() {
+            let raw = match result {
+                Ok(frame) => frame,
+                Err(_) => break,
+            };
 
-    for result in decoder.decode_raw_iter() {
-        let raw = match result {
-            Ok(frame) => frame,
-            Err(_) => break,
-        };
+            let w = raw.width();
+            let h = raw.height();
+            let stride = raw.stride(0);
+            let src = raw.data(0);
 
-        let w = raw.width();
-        let h = raw.height();
-        let stride = raw.stride(0);
-        let src = raw.data(0);
+            // RGB24 with optional stride padding
+            let pix_bytes = w as usize * 3;
 
-        // RGB24 with optional stride padding
-        let pix_bytes = w as usize * 3;
-
-        let rgb_data: Vec<u8> = if stride == pix_bytes {
-            src[..(pix_bytes * h as usize).min(src.len())].to_vec()
-        } else {
-            let mut data = Vec::with_capacity(pix_bytes * h as usize);
-            for y in 0..h as usize {
-                let start = y * stride;
-                let end = start + pix_bytes;
-                if end <= src.len() {
-                    data.extend_from_slice(&src[start..end]);
+            let rgb_data: Vec<u8> = if stride == pix_bytes {
+                src[..(pix_bytes * h as usize).min(src.len())].to_vec()
+            } else {
+                let mut data = Vec::with_capacity(pix_bytes * h as usize);
+                for y in 0..h as usize {
+                    let start = y * stride;
+                    let end = start + pix_bytes;
+                    if end <= src.len() {
+                        data.extend_from_slice(&src[start..end]);
+                    }
                 }
+                data
+            };
+
+            let rgb_img = image::RgbImage::from_raw(w, h, rgb_data)
+                .ok_or_else(|| Error::VideoDecode("dimensioni frame non valide".into()))
+                .unwrap();
+
+            let resized = image::imageops::resize(&rgb_img, out_w, out_h, Triangle);
+            let rgba = image::DynamicImage::ImageRgb8(resized).to_rgba8();
+            if tx.send(rgba).is_err() {
+                break; // receiver dropped (early exit), stop decoding
             }
-            data
-        };
+        }
+    });
 
-        let rgb_img = image::RgbImage::from_raw(w, h, rgb_data)
-            .ok_or_else(|| Error::VideoDecode("dimensioni frame non valide".into()))?;
-
-        let resized = image::imageops::resize(&rgb_img, out_w, out_h, Triangle);
-        let rgba = image::DynamicImage::ImageRgb8(resized).to_rgba8();
-        frames.push(rgba);
-    }
-
-    if frames.is_empty() {
-        return Err(Error::NoFrames(path.display().to_string()));
-    }
-
-    Ok((frames, detected_fps))
+    Ok(detected_fps)
 }
 
 /// Aspect-ratio-preserving size that fits within both constraints.
@@ -238,13 +248,19 @@ fn render_frame(img: &RgbaImage) -> String {
             let lower = img.get_pixel(x, y + 1);
 
             // foreground = lower pixel, background = upper pixel
-            write!(
-                out,
-                "\x1b[38;2;{};{};{}m\x1b[48;2;{};{};{}m\u{2584}",
-                lower[0], lower[1], lower[2],
-                upper[0], upper[1], upper[2],
-            )
-            .unwrap();
+            out.push_str("\x1b[38;2;");
+            out.push_str(LUT[lower[0] as usize]);
+            out.push(';');
+            out.push_str(LUT[lower[1] as usize]);
+            out.push(';');
+            out.push_str(LUT[lower[2] as usize]);
+            out.push_str("m\x1b[48;2;");
+            out.push_str(LUT[upper[0] as usize]);
+            out.push(';');
+            out.push_str(LUT[upper[1] as usize]);
+            out.push(';');
+            out.push_str(LUT[upper[2] as usize]);
+            out.push_str("m\u{2584}");
         }
         out.push_str("\x1b[0m\n");
     }
@@ -253,49 +269,55 @@ fn render_frame(img: &RgbaImage) -> String {
     out
 }
 
-fn render_loop(frames: &[RgbaImage], fps: f32) -> Result<(), Error> {
-    if frames.is_empty() {
-        return Ok(());
-    }
-
+fn render_loop(rx: mpsc::Receiver<RgbaImage>, fps: f32) -> Result<(), Error> {
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
-    let _ = ctrlc::set_handler(move || r.store(false, Ordering::SeqCst));
+    let _ = ctrlc::set_handler(move || {
+        if !r.swap(false, Ordering::SeqCst) {
+            // Second Ctrl-C: force restore terminal and exit
+            let mut stdout = std::io::stdout();
+            use std::io::Write;
+            let _ = write!(stdout, "\x1b[?25h\x1b[?1049l");
+            let _ = stdout.flush();
+            std::process::exit(0);
+        }
+    });
 
     let _screen = AltScreen::enter();
 
-    if frames.len() == 1 {
-        // Single image — show until Ctrl+C
-        let out = render_frame(&frames[0]);
-        print!("{out}");
-        stdout().flush()?;
-        while running.load(Ordering::SeqCst) {
-            std::thread::sleep(Duration::from_millis(200));
-        }
+    // Video — play at the requested framerate
+    let frame_duration = if fps > 0.0 {
+        Duration::from_secs_f32(1.0 / fps)
     } else {
-        // Video — play at the requested framerate
-        let frame_duration = if fps > 0.0 {
-            Duration::from_secs_f32(1.0 / fps)
-        } else {
-            Duration::from_millis(100)
-        };
+        Duration::from_millis(100)
+    };
 
-        print!("\x1b[?25l");
-        stdout().flush().ok();
+    print!("\x1b[?25l");
+    stdout().flush().ok();
 
-        for frame in frames {
-            if !running.load(Ordering::SeqCst) {
-                break;
+    // Poll every 50 ms so Ctrl-C is responsive even without new frames
+    let poll = Duration::from_millis(50);
+
+    loop {
+        if !running.load(Ordering::SeqCst) {
+            break;
+        }
+
+        match rx.recv_timeout(poll) {
+            Ok(frame) => {
+                if !running.load(Ordering::SeqCst) {
+                    break;
+                }
+                let start = Instant::now();
+                print!("{}", render_frame(&frame));
+                stdout().flush()?;
+                let elapsed = start.elapsed();
+                if elapsed < frame_duration {
+                    std::thread::sleep(frame_duration - elapsed);
+                }
             }
-
-            let start = Instant::now();
-            print!("{}", render_frame(frame));
-            stdout().flush()?;
-
-            let elapsed = start.elapsed();
-            if elapsed < frame_duration {
-                std::thread::sleep(frame_duration - elapsed);
-            }
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
 
@@ -476,17 +498,28 @@ mod tests {
 
     #[test]
     fn test_render_frame_starts_and_ends() {
-        let img = RgbaImage::from_raw(4, 4, vec![
-            255, 0, 0, 255,   0, 255, 0, 255,   0, 0, 255, 255,   255, 255, 0, 255,
-            0, 255, 255, 255, 255, 0, 255, 255, 128, 128, 128, 255, 64, 64, 64, 255,
-            100, 50, 0, 255,   50, 100, 0, 255,   0, 100, 50, 255,   50, 0, 100, 255,
-            200, 150, 100, 255, 150, 200, 100, 255, 100, 150, 200, 255, 150, 100, 200, 255,
-        ]).unwrap();
+        let img = RgbaImage::from_raw(
+            4,
+            4,
+            vec![
+                255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255, 0, 255, 255, 255,
+                255, 0, 255, 255, 128, 128, 128, 255, 64, 64, 64, 255, 100, 50, 0, 255, 50, 100, 0,
+                255, 0, 100, 50, 255, 50, 0, 100, 255, 200, 150, 100, 255, 150, 200, 100, 255, 100,
+                150, 200, 255, 150, 100, 200, 255,
+            ],
+        )
+        .unwrap();
 
         let out = render_frame(&img);
-        assert!(out.starts_with("\x1b[?2026h"), "should start with sync begin");
+        assert!(
+            out.starts_with("\x1b[?2026h"),
+            "should start with sync begin"
+        );
         assert!(out.contains("\x1b[H"), "should contain cursor home");
-        assert!(out.ends_with("\x1b[0J\x1b[?2026l"), "should end with clear-to-EOS + sync end");
+        assert!(
+            out.ends_with("\x1b[0J\x1b[?2026l"),
+            "should end with clear-to-EOS + sync end"
+        );
         assert_eq!(out.matches('\n').count(), 2, "4 rows → 2 char rows");
     }
 
@@ -501,10 +534,14 @@ mod tests {
         // 2×2 image → 1 row with 2 half-block chars.
         // Upper row = [255,0,0], [0,255,0]
         // Lower row = [0,0,255], [255,255,0]
-        let img = RgbaImage::from_raw(2, 2, vec![
-            255, 0, 0, 255,   0, 255, 0, 255,
-            0, 0, 255, 255, 255, 255, 0, 255,
-        ]).unwrap();
+        let img = RgbaImage::from_raw(
+            2,
+            2,
+            vec![
+                255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255,
+            ],
+        )
+        .unwrap();
 
         let out = render_frame(&img);
         assert_eq!(out.matches('\u{2584}').count(), 2, "two half-block chars");
@@ -522,11 +559,15 @@ mod tests {
     #[test]
     fn test_render_frame_odd_height() {
         // 2×3 image → only 1 char row (rows 0+1), row 2 is dropped
-        let img = RgbaImage::from_raw(2, 3, vec![
-            255, 0, 0, 255,   0, 255, 0, 255,
-            0, 0, 255, 255, 255, 255, 0, 255,
-            128, 128, 128, 255, 64, 64, 64, 255,
-        ]).unwrap();
+        let img = RgbaImage::from_raw(
+            2,
+            3,
+            vec![
+                255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255, 128, 128, 128,
+                255, 64, 64, 64, 255,
+            ],
+        )
+        .unwrap();
 
         let out = render_frame(&img);
         assert_eq!(out.matches('\n').count(), 1, "3 rows → 1 char row");
@@ -546,13 +587,6 @@ mod tests {
         let e = Error::UnknownFormat("xyz".into());
         let s = e.to_string();
         assert!(s.contains("xyz") && s.contains("non supportato"));
-    }
-
-    #[test]
-    fn test_error_no_frames() {
-        let e = Error::NoFrames("x.mp4".into());
-        let s = e.to_string();
-        assert!(s.contains("x.mp4") && s.contains("Nessun frame"));
     }
 
     #[test]

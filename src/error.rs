@@ -8,7 +8,6 @@ pub enum ImgToTerminalError {
     VideoDecode(String),
     VideoInit(String),
     ImageLoad(String),
-    NoFrames(String),
     TerminalTooSmall(u16, u16),
     IoError(std::io::Error),
 }
@@ -56,13 +55,6 @@ impl fmt::Display for ImgToTerminalError {
                     f,
                     "Impossibile caricare l'immagine: {detail}.\n\
                      Verifica che il file non sia corrotto."
-                )
-            }
-            ImgToTerminalError::NoFrames(path) => {
-                write!(
-                    f,
-                    "Nessun frame valido trovato in '{path}'.\n\
-                     Il file potrebbe essere vuoto o illeggibile."
                 )
             }
             ImgToTerminalError::TerminalTooSmall(cols, rows) => {
